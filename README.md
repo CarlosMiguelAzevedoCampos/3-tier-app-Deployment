@@ -213,3 +213,75 @@ If you find this project helpful, please consider giving it a ⭐ on GitHub!
 Pull requests and suggestions are welcome 🤝
 
 ---
+
+
+
+## This is needed for the aws loadbalancer to work
+
+# --- Vars ---
+
+# Make sure kubectl points to the right cluster
+aws eks update-kubeconfig --name $CLUSTER --region $REGION
+kubectl config current-context
+
+# Ensure OIDC provider exists for this cluster (idempotent)
+eksctl utils associate-iam-oidc-provider \
+  --cluster $CLUSTER \
+  --region  $REGION \
+  --approve
+
+# Get OIDC issuer -> build provider ARN
+OIDC_ISSUER=$(aws eks describe-cluster --name $CLUSTER --region $REGION --query "cluster.identity.oidc.issuer" --output text)
+OIDC_HOSTPATH=${OIDC_ISSUER#https://}
+OIDC_PROVIDER_ARN=arn:aws:iam::$ACCOUNT_ID:oidc-provider/$OIDC_HOSTPATH
+echo "OIDC_PROVIDER_ARN = $OIDC_PROVIDER_ARN"
+
+# Create IAM trust policy for the K8s SA kube-system/aws-load-balancer-controller
+cat > trust-policy.json <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": { "Federated": "$OIDC_PROVIDER_ARN" },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "$OIDC_HOSTPATH:aud": "sts.amazonaws.com",
+          "$OIDC_HOSTPATH:sub": "system:serviceaccount:kube-system:aws-load-balancer-controller"
+        }
+      }
+    }
+  ]
+}
+EOF
+
+# Create the IAM role & attach the LB controller policy
+aws iam create-role --role-name $ROLE_NAME --assume-role-policy-document file://trust-policy.json
+aws iam attach-role-policy --role-name $ROLE_NAME --policy-arn $POLICY_ARN
+
+# Get the Role ARN
+ROLE_ARN=$(aws iam get-role --role-name $ROLE_NAME --query Role.Arn --output text)
+echo "ROLE_ARN = $ROLE_ARN"
+
+# Get the VPC ID from its Name tag
+VPC_ID=$(aws ec2 describe-vpcs --region $REGION \
+  --filters "Name=tag:Name,Values=${VPC_NAME}" \
+  --query "Vpcs[0].VpcId" --output text)
+echo "VPC_ID = $VPC_ID"
+
+# (Re)install the AWS Load Balancer Controller
+# Let Helm CREATE the ServiceAccount and annotate it with your Role ARN
+helm -n kube-system upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
+  --set clusterName=$CLUSTER \
+  --set region=$REGION \
+  --set vpcId=$VPC_ID \
+  --set installCRDs=true \
+  --set serviceAccount.create=true \
+  --set serviceAccount.name=aws-load-balancer-controller \
+  --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"="${ROLE_ARN}"
+
+# Verify
+kubectl -n kube-system get sa aws-load-balancer-controller -o yaml | sed -n '/annotations:/,/labels:/p'
+kubectl -n kube-system get deploy aws-load-balancer-controller
+kubectl -n kube-system logs deploy/aws-load-balancer-controller
